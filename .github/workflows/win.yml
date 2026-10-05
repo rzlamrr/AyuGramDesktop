@@ -36,11 +36,20 @@ jobs:
 
     steps:
       - name: Prepare directories.
+        shell: pwsh
         run: |
-          mkdir %userprofile%\TBuild\Libraries
-          mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
-          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
-          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}}, @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}}
+          # Build on the drive with the most free space, the C: drive alone
+          # is not enough for libraries plus the Telegram build tree.
+          $drive = Get-PSDrive -PSProvider FileSystem |
+            Where-Object { $_.Name.Length -eq 1 -and $_.Free } |
+            Sort-Object Free -Descending | Select-Object -First 1
+          $target = "$($drive.Name):\TBuild"
+          Write-Host "Using $target"
+          New-Item -ItemType Directory -Force "$target\Libraries" | Out-Null
+          cmd /c mklink /d "$env:GITHUB_WORKSPACE\TBuild" "$target"
+          "TBUILD=$env:GITHUB_WORKSPACE\TBuild" >> $env:GITHUB_ENV
+          "LibrariesPath=$env:GITHUB_WORKSPACE\TBuild\Libraries\win64" >> $env:GITHUB_ENV
 
       - name: Get repository name.
         shell: bash
