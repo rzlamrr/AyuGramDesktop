@@ -22,9 +22,8 @@ on:
         options: [ release, debug ]
         default: release
       arch:
-        description: Target architecture
-        type: choice
-        options: [ x64, x64_x86, arm64 ]
+        description: Target architectures, comma separated (x64, x64_x86, arm64)
+        type: string
         default: x64
 
 concurrency:
@@ -35,14 +34,67 @@ permissions:
   contents: write
 
 jobs:
+  setup:
+    name: Setup
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      config: ${{ steps.matrix.outputs.config }}
+
+    steps:
+      - name: Build matrix.
+        id: matrix
+        env:
+          INPUT_ARCH: ${{ inputs.arch || 'x64' }}
+          INPUT_CONFIG: ${{ inputs.config || 'release' }}
+        run: |
+          case "$INPUT_CONFIG" in
+            release|debug) ;;
+            *) echo "::error::Unknown config '$INPUT_CONFIG'"; exit 1 ;;
+          esac
+          matrix='[]'
+          for arch in $(echo "$INPUT_ARCH" | tr ',' ' '); do
+            case "$arch" in
+              x64|x64_x86) runner=windows-latest; toolset=14.44 ;;
+              arm64) runner=windows-11-arm; toolset= ;;
+              *) echo "::error::Unknown arch '$arch'"; exit 1 ;;
+            esac
+            matrix=$(echo "$matrix" | jq -c --arg arch "$arch" --arg runner "$runner" --arg toolset "$toolset" \
+              'if any(.[]; .arch == $arch) then . else . + [{arch: $arch, runner: $runner, toolset: $toolset}] end')
+          done
+          if [ "$matrix" = '[]' ]; then
+            echo "::error::No architectures selected"; exit 1
+          fi
+          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+          echo "config=$INPUT_CONFIG" >> $GITHUB_OUTPUT
+
+      # Created once here, every architecture then uploads its own asset.
+      - name: Create release.
+        if: steps.matrix.outputs.config == 'release'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: win-build-${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          name: Windows build ${{ github.run_number }} (${{ github.sha }})
+          body: |
+            Release build of `${{ github.sha }}` from `${{ github.ref_name }}`.
+          prerelease: true
+
   windows:
-    name: Windows ${{ inputs.arch || 'x64' }} ${{ inputs.config || 'release' }}
-    runs-on: ${{ (inputs.arch || 'x64') == 'arm64' && 'windows-11-arm' || 'windows-latest' }}
+    name: Windows ${{ matrix.arch }}
+    needs: setup
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
 
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.setup.outputs.matrix) }}
+
     env:
-      ARCH: ${{ inputs.arch || 'x64' }}
-      CONFIG: ${{ inputs.config || 'release' }}
+      # Not CONFIG: pacman-key in the msys2 stage reads that variable.
+      BUILD_ARCH: ${{ matrix.arch }}
+      BUILD_KIND: ${{ needs.setup.outputs.config }}
       PREPARE_PATH: "Telegram/build/prepare/prepare.py"
 
     defaults:
@@ -65,18 +117,18 @@ jobs:
           cmd /c mklink /d "$env:GITHUB_WORKSPACE\TBuild" "$target"
 
           $libs = "$env:GITHUB_WORKSPACE\TBuild\Libraries"
-          if ($env:ARCH -eq 'x64') { $libs += '\win64' }
+          if ($env:BUILD_ARCH -eq 'x64') { $libs += '\win64' }
           "TBUILD=$env:GITHUB_WORKSPACE\TBuild" >> $env:GITHUB_ENV
           "LibrariesPath=$libs" >> $env:GITHUB_ENV
 
           # Debug builds skip the release libraries, so the caches differ.
-          $suffix = if ($env:CONFIG -eq 'release') { '-release' } else { '' }
-          "CACHE_PREFIX=$env:RUNNER_OS-$env:ARCH$suffix" >> $env:GITHUB_ENV
-          "PREPARE_ARGS=$(if ($env:CONFIG -eq 'release') { 'silent' } else { 'skip-release silent' })" >> $env:GITHUB_ENV
-          "BUILD_CONFIG=$(if ($env:CONFIG -eq 'release') { 'Release' } else { 'Debug' })" >> $env:GITHUB_ENV
-          $configureArch = switch ($env:ARCH) { 'x64_x86' { 'x86' } 'arm64' { 'arm' } default { 'x64' } }
+          $suffix = if ($env:BUILD_KIND -eq 'release') { '-release' } else { '' }
+          "CACHE_PREFIX=$env:RUNNER_OS-$env:BUILD_ARCH$suffix" >> $env:GITHUB_ENV
+          "PREPARE_ARGS=$(if ($env:BUILD_KIND -eq 'release') { 'silent' } else { 'skip-release silent' })" >> $env:GITHUB_ENV
+          "BUILD_CONFIG=$(if ($env:BUILD_KIND -eq 'release') { 'Release' } else { 'Debug' })" >> $env:GITHUB_ENV
+          $configureArch = switch ($env:BUILD_ARCH) { 'x64_x86' { 'x86' } 'arm64' { 'arm' } default { 'x64' } }
           "CONFIGURE_ARCH=$configureArch" >> $env:GITHUB_ENV
-          "CONFIGURE_EXTRA=$(if ($env:CONFIG -eq 'release') { '' } else { '-D CMAKE_MSVC_DEBUG_INFORMATION_FORMAT=' })" >> $env:GITHUB_ENV
+          "CONFIGURE_EXTRA=$(if ($env:BUILD_KIND -eq 'release') { '' } else { '-D CMAKE_MSVC_DEBUG_INFORMATION_FORMAT=' })" >> $env:GITHUB_ENV
 
       - name: Get repository name.
         shell: bash
@@ -106,7 +158,7 @@ jobs:
           git config --global user.name "Sample"
 
       - name: Install VS 2026 Build Tools.
-        if: env.ARCH == 'arm64'
+        if: env.BUILD_ARCH == 'arm64'
         shell: pwsh
         run: |
           $exe = Join-Path $env:RUNNER_TEMP 'vs_buildtools.exe'
@@ -120,19 +172,11 @@ jobs:
           if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { exit $p.ExitCode }
 
       - name: Native Tools Command Prompt.
-        if: env.ARCH != 'arm64'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: rzlamrr/msvc-dev-cmd@v2
         with:
-          arch: ${{ env.ARCH }}
+          arch: ${{ matrix.arch }}
           sdk: ${{ env.SDK }}
-          toolset: 14.44
-
-      - name: Native Tools Command Prompt (ARM64).
-        if: env.ARCH == 'arm64'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: arm64
-          sdk: ${{ env.SDK }}
+          toolset: ${{ matrix.toolset }}
 
       - name: NuGet sources.
         run: |
@@ -235,29 +279,24 @@ jobs:
           New-Item -ItemType Directory artifact | Out-Null
           Move-Item "$out\AyuGram.exe" artifact\
           if (Test-Path "$out\Updater.exe") { Move-Item "$out\Updater.exe" artifact\ }
-          if ($env:CONFIG -eq 'release') {
-            $zip = "AyuGram-win-$env:ARCH.zip"
+          if ($env:BUILD_KIND -eq 'release') {
+            $zip = "AyuGram-win-$env:BUILD_ARCH.zip"
             Compress-Archive -Path artifact\* -DestinationPath $zip
             "RELEASE_ASSET=$zip" >> $env:GITHUB_ENV
           }
 
       - name: Upload artifact (debug).
-        if: env.CONFIG == 'debug'
+        if: env.BUILD_KIND == 'debug'
         uses: actions/upload-artifact@v7
         with:
-          name: AyuGram-win-${{ env.ARCH }}-debug
+          name: AyuGram-win-${{ env.BUILD_ARCH }}-debug
           path: artifact
           if-no-files-found: error
 
       - name: Upload to release.
-        if: env.CONFIG == 'release'
+        if: env.BUILD_KIND == 'release'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: win-build-${{ github.run_number }}
-          target_commitish: ${{ github.sha }}
-          name: Windows build ${{ github.run_number }} (${{ github.sha }})
-          body: |
-            Release build of `${{ github.sha }}` from `${{ github.ref_name }}`.
-          prerelease: true
           files: ${{ env.RELEASE_ASSET }}
           fail_on_unmatched_files: true
