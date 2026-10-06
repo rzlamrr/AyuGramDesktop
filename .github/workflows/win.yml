@@ -171,6 +171,22 @@ jobs:
           Remove-Item $exe -Force -ErrorAction SilentlyContinue
           if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { exit $p.ExitCode }
 
+      - name: Install ATL for the 14.44 toolset.
+        if: env.BUILD_KIND == 'release' && env.BUILD_ARCH != 'arm64'
+        shell: pwsh
+        run: |
+          # breakpad (release only) needs atlbase.h of the 14.44 toolset.
+          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
+          $path = & "$installer\vswhere.exe" -latest -products * -property installationPath
+          $header = { Get-ChildItem "$path\VC\Tools\MSVC\14.44*\atlmfc\include\atlbase.h" -ErrorAction SilentlyContinue }
+          if (& $header) { Write-Host "ATL is already installed"; exit 0 }
+          $p = Start-Process "$installer\setup.exe" -Wait -PassThru -ArgumentList `
+            'modify','--installPath',"`"$path`"", `
+            '--add','Microsoft.VisualStudio.Component.VC.14.44.17.14.ATL', `
+            '--quiet','--norestart','--nocache'
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { exit $p.ExitCode }
+          if (-not (& $header)) { throw "atlbase.h of the 14.44 toolset is still missing" }
+
       - name: Native Tools Command Prompt.
         uses: rzlamrr/msvc-dev-cmd@v2
         with:
@@ -188,8 +204,10 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ${{ env.TBUILD }}\ThirdParty
-          key: ${{ env.CACHE_PREFIX }}-third-party-${{ env.CACHE_KEY }}
-          restore-keys: ${{ env.CACHE_PREFIX }}-third-party-
+          key: ${{ env.CACHE_PREFIX }}-third-party-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ env.CACHE_PREFIX }}-third-party-${{ env.CACHE_KEY }}-
+            ${{ env.CACHE_PREFIX }}-third-party-
 
       - name: Libraries cache.
         id: cache-libs
@@ -201,8 +219,10 @@ jobs:
             !${{ env.LibrariesPath }}\[qQ]t[_-]*
             ${{ env.LibrariesPath }}\cache_keys\*
             !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
-          key: ${{ env.CACHE_PREFIX }}-libs-v2-${{ env.CACHE_KEY }}
-          restore-keys: ${{ env.CACHE_PREFIX }}-libs-v2-
+          key: ${{ env.CACHE_PREFIX }}-libs-v2-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ env.CACHE_PREFIX }}-libs-v2-${{ env.CACHE_KEY }}-
+            ${{ env.CACHE_PREFIX }}-libs-v2-
 
       - name: Qt cache.
         id: cache-qt
@@ -211,28 +231,32 @@ jobs:
           path: |
             ${{ env.LibrariesPath }}\[qQ]t[_-]*
             ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
-          key: ${{ env.CACHE_PREFIX }}-qt-${{ env.CACHE_KEY }}
-          restore-keys: ${{ env.CACHE_PREFIX }}-qt-
+          key: ${{ env.CACHE_PREFIX }}-qt-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ env.CACHE_PREFIX }}-qt-${{ env.CACHE_KEY }}-
+            ${{ env.CACHE_PREFIX }}-qt-
 
       - name: Libraries.
         run: |
           %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat %PREPARE_ARGS%
 
       - name: Free up some disk space.
+        if: ${{ !cancelled() }}
         shell: bash
         run: find $LibrariesPath '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' -o -path '*/nv-codec-headers/*' ')' -type f ')' -o -empty ')' -delete
 
-      # Saved right after the libraries are ready, so a failing build
-      # does not throw the libraries away.
+      # Saved right after the libraries step, even when it failed halfway:
+      # finished stages are kept, so a retry resumes instead of starting over.
+      # The run id keeps every save unique, restore picks the newest by prefix.
       - name: Save ThirdParty cache.
-        if: steps.cache-third-party.outputs.cache-hit != 'true'
+        if: ${{ !cancelled() }}
         uses: actions/cache/save@v6
         with:
           path: ${{ env.TBUILD }}\ThirdParty
-          key: ${{ env.CACHE_PREFIX }}-third-party-${{ env.CACHE_KEY }}
+          key: ${{ env.CACHE_PREFIX }}-third-party-${{ env.CACHE_KEY }}-${{ github.run_id }}
 
       - name: Save Libraries cache.
-        if: steps.cache-libs.outputs.cache-hit != 'true'
+        if: ${{ !cancelled() }}
         uses: actions/cache/save@v6
         with:
           path: |
@@ -241,16 +265,16 @@ jobs:
             !${{ env.LibrariesPath }}\[qQ]t[_-]*
             ${{ env.LibrariesPath }}\cache_keys\*
             !${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
-          key: ${{ env.CACHE_PREFIX }}-libs-v2-${{ env.CACHE_KEY }}
+          key: ${{ env.CACHE_PREFIX }}-libs-v2-${{ env.CACHE_KEY }}-${{ github.run_id }}
 
       - name: Save Qt cache.
-        if: steps.cache-qt.outputs.cache-hit != 'true'
+        if: ${{ !cancelled() }}
         uses: actions/cache/save@v6
         with:
           path: |
             ${{ env.LibrariesPath }}\[qQ]t[_-]*
             ${{ env.LibrariesPath }}\cache_keys\[qQ]t[_-]*
-          key: ${{ env.CACHE_PREFIX }}-qt-${{ env.CACHE_KEY }}
+          key: ${{ env.CACHE_PREFIX }}-qt-${{ env.CACHE_KEY }}-${{ github.run_id }}
 
       - name: AyuGram Desktop build.
         env:
